@@ -1,20 +1,13 @@
 {
   "permissions": {
     "allow": [
-      "WebFetch(domain:docs.google.com)",
-      "WebFetch(domain:doc-04-4k-docstext.googleusercontent.com)",
-      "Bash(git push:*)",
-      "Bash(pip list:*)",
-      "Bash(npm list:*)",
-      "Bash(pip3 list:*)",
-      "WebFetch(domain:www.linkedin.com)",
-      "Bash(gws --version)",
-      "Bash(sudo apt-get:*)",
-      "Bash(pip install:*)",
-      "Bash(pip3 install:*)",
-      "Bash(python3 -m pip install pypandoc-binary)",
-      "Bash(conda install:*)",
-      "Bash(npx markdown-to-docx:*)"
+      "Bash(*)",
+      "Edit(*)",
+      "Write(*)",
+      "Read(*)",
+      "WebFetch(*)",
+      "Glob(*)",
+      "Grep(*)"
     ]
   }
 }

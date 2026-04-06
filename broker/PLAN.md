@@ -185,6 +185,7 @@ A single-process server that appends records, reads by offset, and recovers from
 - Log segmentation: why a single file doesn't scale
 - Sparse indexes: trading memory for lookup speed
 - Memory-mapped files (optional): using mmap for index files
+- Log retention: deleting old segments by time or size
 
 ### Step 2.1: Understand Why Segments
 
@@ -241,7 +242,26 @@ In the `Append` method:
 3. After writing, check if `activeSegment.size >= maxSegmentSize`
 4. If so, close the current segment (make it read-only) and create a new active segment with `baseOffset = nextOffset`
 
-### Step 2.5: Update Crash Recovery
+### Step 2.5: Log Retention
+
+Segments that grow forever waste disk. Implement a background goroutine that periodically checks for segments eligible for deletion:
+
+```
+type RetentionPolicy struct {
+    MaxAge      time.Duration  // delete segments older than this (e.g., 7 days)
+    MaxLogSize  int64          // delete oldest segments when total log exceeds this (e.g., 1 GB)
+}
+```
+
+**Rules**:
+1. Never delete the active segment (the one being written to)
+2. Check the last modified time of each segment file — if older than `MaxAge`, delete it
+3. If total log size exceeds `MaxLogSize`, delete the oldest segments first until under the limit
+4. Run this check every 60 seconds in a background goroutine
+
+This is how real Kafka manages disk usage. It's also why segment boundaries matter — you can only delete whole segments, not individual records.
+
+### Step 2.6: Update Crash Recovery
 
 On startup:
 1. List all `.log` files in the directory, sorted by base offset
@@ -249,13 +269,15 @@ On startup:
 3. Rebuild the index if it's missing or corrupt (just re-scan the log)
 4. The last segment becomes the active segment
 
-### Step 2.6: Test It
+### Step 2.7: Test It
 
 - Write enough records to trigger multiple segment rolls
 - Verify fetch by offset works across segment boundaries
 - Verify fetch is significantly faster than Week 1 for large offsets
 - Corrupt an index file, restart, verify it gets rebuilt
 - Kill mid-write, restart, verify only the last segment needs recovery
+- Set a short retention policy, verify old segments get deleted
+- Verify fetching a deleted offset returns an appropriate error (e.g., "offset out of range")
 
 ### Deliverable
 Log is split into segments with sparse indexes. Fetch by offset is fast regardless of log size.
@@ -356,6 +378,8 @@ Response: { "status": "created" }
 ### Deliverable
 Multi-topic, multi-partition broker. Records route to partitions by key hash.
 
+> **Heads-up**: In Week 4, you'll distribute partitions across multiple brokers. This means refactoring the produce/fetch paths so they route requests to the correct broker rather than always handling them locally. Design your `TopicManager` with this in mind — keep the partition-level log logic separate from the "am I the right broker for this?" routing logic, so the refactor is straightforward.
+
 ---
 
 ## Week 4: Controller + Cluster Metadata
@@ -454,15 +478,27 @@ Now produce/fetch must be routed to the correct leader:
 
 For simplicity, start with returning an error + leader address. The client retries against the correct broker.
 
-### Step 4.7: Test It
+### Step 4.7: Controller Persistence
+
+The controller is a single point of failure. If it crashes, all metadata (broker registrations, partition assignments, committed offsets) is lost. Mitigate this by persisting state to disk:
+
+1. Write the full metadata state (assignments, broker list, consumer group offsets) to a JSON file on every mutation
+2. On startup, load from this file if it exists
+3. Brokers re-register on startup anyway (via heartbeats), so the controller can reconcile stale broker info with live heartbeats
+
+This doesn't make the controller highly available (that would require Raft/Paxos), but it survives restarts. In interviews, be ready to discuss: "What would you need for a fully fault-tolerant controller?" (Answer: replicated state machine via consensus protocol, e.g., what Kafka did with KRaft.)
+
+### Step 4.8: Test It
 
 - Register 3 brokers, verify metadata shows all alive
 - Stop sending heartbeats from one broker, verify it's marked dead after timeout
 - Create a topic, verify partitions are assigned across brokers
 - Produce to a non-leader, verify you get redirected to the correct leader
+- Kill and restart the controller, verify it recovers metadata from disk
+- Verify brokers re-register and the cluster resumes normal operation
 
 ### Deliverable
-Controller tracks broker liveness and partition assignments. Topic creation distributes partitions across brokers.
+Controller tracks broker liveness and partition assignments. Topic creation distributes partitions across brokers. Controller state persists across restarts.
 
 ---
 
@@ -537,8 +573,13 @@ type PartitionState struct {
 
 **`acks=all`**: Return success only after ALL ISR members have replicated the record. The leader must wait until `HighWatermark >= record's offset`.
 
-Implementation:
+Implementation — use a `sync.Cond` to avoid polling:
 ```
+type PartitionState struct {
+    // ... existing fields ...
+    hwCond *sync.Cond  // signaled whenever HighWatermark advances
+}
+
 func (b *Broker) Produce(tp TopicPartition, record Record, acks int) (uint64, error) {
     offset := b.log.Append(tp, record)
 
@@ -547,15 +588,24 @@ func (b *Broker) Produce(tp TopicPartition, record Record, acks int) (uint64, er
     }
 
     // acks=all: wait for high watermark to advance past this offset
+    ps := b.partitionState[tp]
+    ps.hwCond.L.Lock()
+    defer ps.hwCond.L.Unlock()
+
     deadline := time.Now().Add(10 * time.Second)
-    for time.Now().Before(deadline) {
-        if b.partitionState[tp].HighWatermark >= offset {
-            return offset, nil
+    for ps.HighWatermark < offset {
+        // Wait with timeout — hwCond is signaled by the replication ack handler
+        // whenever it updates HighWatermark
+        if time.Now().After(deadline) {
+            return 0, errors.New("replication timeout")
         }
-        sleep(10ms)
+        ps.hwCond.Wait()
     }
-    return 0, errors.New("replication timeout")
+    return offset, nil
 }
+
+// In the replication ack handler, after updating HighWatermark:
+// ps.hwCond.Broadcast()
 ```
 
 ### Step 5.5: Add Replication API Endpoints
@@ -863,10 +913,43 @@ Edge case: the old leader isn't actually dead, just slow. It might still be acce
 - A leader rejects requests with a newer epoch (it knows it's been superseded)
 - Produce requests include the epoch; if the broker's epoch is stale, it rejects the request
 
-### Step 8.5: Docker Compose Setup
+### Step 8.5: Batched Produce and Fetch
+
+Single-record produce/fetch has high overhead from per-request serialization, network round trips, and fsync calls. Batching amortizes these costs.
+
+**Batched Produce API**:
+```
+POST /produce
+{
+  "topic": "orders",
+  "records": [
+    {"key": "user-1", "value": "...", "eventTime": 1700000000000},
+    {"key": "user-2", "value": "...", "eventTime": 1700000000001},
+    {"key": "user-3", "value": "...", "eventTime": 1700000000002}
+  ],
+  "acks": 1
+}
+Response: { "offsets": [{"partition": 0, "offset": 100}, {"partition": 1, "offset": 200}, ...] }
+```
+
+**Implementation**:
+1. Group records by partition (hash each key)
+2. For each partition, append all records in one write + single fsync (instead of fsync per record)
+3. For acks=all, wait for the high watermark to cover all records in the batch
+4. Return all (partition, offset) pairs in one response
+
+**Batched Fetch API**:
+```
+GET /fetch?topic=orders&partition=0&offset=100&maxBytes=1048576
+```
+
+Instead of `max=N` records, use `maxBytes` — return as many records as fit within the byte limit. This is more efficient because it adapts to varying record sizes.
+
+**Why this matters for interviews**: Batching is one of the main reasons Kafka achieves high throughput. Being able to explain the trade-off (latency vs. throughput) and how `linger.ms` works in real Kafka (the producer waits a short time to accumulate a batch before sending) shows operational depth.
+
+### Step 8.6: Docker Compose Setup
 
 ```yaml
-version: '3.8'
 services:
   controller:
     build: .
@@ -904,7 +987,7 @@ volumes:
   broker3-data:
 ```
 
-### Step 8.6: Chaos Script: `kill_broker.sh`
+### Step 8.7: Chaos Script: `kill_broker.sh`
 ```bash
 #!/bin/bash
 BROKER=${1:-broker1}
@@ -922,7 +1005,7 @@ echo "Verifying catch-up..."
 curl -s http://localhost:8080/metadata | python3 -m json.tool
 ```
 
-### Step 8.7: End-to-End Integration Test
+### Step 8.8: End-to-End Integration Test
 
 Write a script that:
 1. Starts the cluster (3 brokers + controller)
@@ -933,7 +1016,7 @@ Write a script that:
 6. Verifies: failover happens, new leader is promoted, consumers resume, no records are lost
 7. Restarts the killed broker, verifies it rejoins as a follower and catches up
 
-### Step 8.8: Observability — `/metrics` Endpoint
+### Step 8.9: Observability — `/metrics` Endpoint
 
 Expose JSON counters on each broker:
 ```json
@@ -962,7 +1045,7 @@ Expose JSON counters on each broker:
 
 **Consumer lag** = High Watermark - Committed Offset. This is the single most important operational metric for any Kafka deployment.
 
-### Step 8.9: Write the README
+### Step 8.10: Write the README
 
 Document:
 1. Architecture diagram
@@ -976,8 +1059,11 @@ Document:
 
 - [ ] `docker-compose up` starts 3 brokers + 1 controller
 - [ ] Producer writes records and receives (partition, offset) acknowledgment
+- [ ] Batched produce/fetch endpoints work with multiple records per request
+- [ ] Log retention deletes old segments by age or total size
 - [ ] Consumer reads from offsets; consumer groups split partitions across members
 - [ ] Leader failover: kill a broker, a new leader is elected, produce/fetch continue
+- [ ] Controller persists metadata to disk and recovers on restart
 - [ ] `/metrics` endpoint exposes lag, replication stats, QPS
 - [ ] README documents invariants, failure modes, and demo commands
 - [ ] Chaos scripts: `kill_broker.sh`, `kill_consumer.sh`
@@ -985,9 +1071,48 @@ Document:
 
 ---
 
-## Recommended Reading (alongside implementation)
+## Interview Talking Point: Why Not Exactly-Once?
 
-- **Chapters 5-7 of *Designing Data-Intensive Applications*** — Replication, Partitioning, Transactions
+This project achieves **at-least-once** delivery. Records may be re-delivered after a consumer crash (between processing and committing the offset). Understanding why **exactly-once** is harder is a common interview topic:
+
+**What you'd need for exactly-once on the producer side (idempotent producer)**:
+- Assign each producer a unique Producer ID (PID) and a sequence number per partition
+- The broker deduplicates by (PID, partition, sequence number) — if it sees a duplicate, it returns the existing offset instead of appending again
+- This handles retries (producer crashes after sending but before receiving the ack)
+
+**What you'd need for exactly-once on the consumer side (transactional consume-process-produce)**:
+- Consumers commit their offset and write their output in a single atomic transaction
+- This requires the offset store and the output destination to participate in the same transaction (e.g., both in Kafka, or using a two-phase commit with an external database)
+
+**Why we skip it**: Implementing idempotent producers and transactions adds significant complexity. In practice, most systems are designed to tolerate at-least-once delivery by making consumers idempotent (processing the same record twice produces the same result). Being able to explain this trade-off is more valuable in interviews than actually building exactly-once.
+
+---
+
+## Recommended Reading
+
+### DDIA Reading Plan (aligned to weeks)
+
+**Before starting (read first):**
+- **Chapter 3: Storage and Retrieval** — Log-structured storage, SSTables, indexing. Directly maps to Weeks 1-2 (append-only log, segments, sparse index). Most important chapter to read first.
+- **Chapter 5: Replication** (first half) — Leader/follower replication model. Read the concepts before Week 5 so you understand *why* before you build it.
+
+**During implementation:**
+
+| Week | DDIA Chapter | Why |
+|------|-------------|-----|
+| Week 3 (Partitions) | **Chapter 6: Partitioning** | Hash-based partitioning, rebalancing strategies |
+| Week 4 (Controller) | **Chapter 8: The Trouble with Distributed Systems** | Failure detection, timeouts, heartbeats — why distributed coordination is hard |
+| Week 5 (Replication) | **Chapter 5: Replication** (re-read fully) | ISR, consistency guarantees, replication lag |
+| Week 7 (Rebalance) | **Chapter 9: Consistency and Consensus** | Leader election, fencing tokens, epoch numbers |
+| Week 8 (Failover) | **Chapter 9** (re-read) | Fencing and split-brain prevention |
+
+**After finishing Project 1:**
+- **Chapter 11: Stream Processing** — The "why Kafka exists" big picture; sets up Project 2 (Streaming Engine)
+
+**Skip:** Chapters 1-2 (too high-level), 4 (encoding — you'll learn by doing), 7 (transactions — not needed until exactly-once), 10 (batch processing — not relevant)
+
+### Other Resources
+
 - **Kafka documentation: Design section** — https://kafka.apache.org/documentation/#design
 - **The Log (Jay Kreps)** — https://engineering.linkedin.com/distributed-systems/log-what-every-software-engineer-should-know-about-real-time-datas-unifying — the foundational essay on why logs matter
 - **Kafka ISR explanation** — understand in-sync replicas deeply, it's asked in every distributed systems interview
